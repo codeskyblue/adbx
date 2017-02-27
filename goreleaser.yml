@@ -1,0 +1,4 @@
+# Build customization
+brew:
+  repo: openatx/homebrew-tap
+  folder: Formula
