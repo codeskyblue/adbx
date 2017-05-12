@@ -4,14 +4,21 @@ import (
 	"archive/zip"
 	"encoding/json"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"log"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"strings"
 	"syscall"
+	"time"
 
+	"github.com/cheggaaa/pb"
 	"github.com/codeskyblue/httpfs"
+	"github.com/franela/goreq"
 	"github.com/wmbest2/android/apk"
+	goadb "github.com/yosemite-open/go-adb"
 )
 
 func ErrToExitCodo(err error) int {
@@ -33,7 +40,8 @@ func ErrToExitCodo(err error) int {
 }
 
 var cmds = map[string]func(...string){
-	"parse": cmdParse,
+	"parse":   cmdParse,
+	"install": cmdInstall,
 }
 
 func readManifestFromZip(zrd *zip.Reader) (data []byte, err error) {
@@ -106,13 +114,99 @@ func cmdParse(args ...string) {
 	parseManifest(data)
 }
 
+func cmdInstall(args ...string) {
+	filename := args[len(args)-1]
+	args = args[:len(args)-1]
+
+	name := filepath.Base(filename)
+	if !strings.HasSuffix(name, ".apk") {
+		name += ".apk"
+	}
+	dest := "/data/local/tmp/" + name
+	var reader io.Reader
+	var length int64
+	var err error
+	if strings.HasPrefix(filename, "http://") || strings.HasPrefix(filename, "https://") {
+		log.Println("Pushing HTTP file to device")
+		res, err := goreq.Request{Uri: filename}.Do()
+		if err != nil {
+			log.Fatal(err)
+		}
+		fmt.Sscanf(res.Header.Get("Content-Length"), "%d", &length)
+		defer res.Body.Close()
+		reader = res.Body
+	} else {
+		file, err := os.Open(filename)
+		if err != nil {
+			log.Fatal(err)
+		}
+		defer file.Close()
+		reader = file
+	}
+	bar := pb.New(int(length)).SetUnits(pb.U_BYTES) //.SetRefreshRate(time.Millisecond * 100)
+	bar.ShowSpeed = true
+	bar.ShowTimeLeft = true
+	bar.ManualUpdate = true
+
+	done := make(chan bool)
+	//if length == 0 {
+	//	log.Println("Source size is unknown, can not show progress")
+	//} else {
+	bar.Start()
+	go func() {
+		for {
+			fstat, er := device.Stat(dest)
+			if er == nil {
+				bar.Set(int(fstat.Size))
+				bar.Update()
+			}
+			select {
+			case <-time.After(time.Millisecond * 200):
+			case <-done:
+				return
+			}
+		}
+	}()
+	_, err = device.WriteToFile(dest, reader, 0644)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	// Success push file
+	done <- true
+	bar.Finish()
+
+	log.Printf("Install apk to android system (%s)", dest)
+	defer func() {
+		// log.Println("Clean up apk file")
+		device.RunCommand("rm", dest)
+	}()
+	output, err := device.RunCommand("pm", append([]string{"install"}, append(args, dest)...)...)
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Print(output)
+}
+
+var device *goadb.Device
+
 func main() {
 	if len(os.Args) > 1 {
-		subCmd := os.Args[1]
-		args := os.Args[2:]
+		args := os.Args[1:]
+		adb, err := goadb.New()
+		if err != nil {
+			log.Fatal(err)
+		}
+		if args[0] == "-s" {
+			device = adb.Device(goadb.DeviceWithSerial(args[1]))
+			args = args[2:]
+		} else {
+			device = adb.Device(goadb.AnyDevice())
+		}
+		subCmd := args[0]
 		fn, ok := cmds[subCmd]
 		if ok {
-			fn(args...)
+			fn(args[1:]...)
 			return
 		}
 	}
